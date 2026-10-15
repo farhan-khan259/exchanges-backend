@@ -1,0 +1,44 @@
+{
+  "name": "@khata/backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node api.js && tsx watch src/index.ts",
+    "build": "node api.js && node scripts/clean.mjs && tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "start": "node api.js && node dist/src/index.js",
+    "seed": "tsx scripts/seed.ts",
+    "db:init": "tsx scripts/init.ts",
+    "db:import": "tsx scripts/import-json.ts",
+    "test": "node scripts/test.mjs",
+    "test:unit": "node --import tsx --test tests/accounting.test.ts tests/print.test.ts",
+    "test:browser": "node scripts/browser-test.mjs"
+  },
+  "dependencies": {
+    "bcryptjs": "3.0.2",
+    "cookie-parser": "1.4.7",
+    "decimal.js": "10.6.0",
+    "dotenv": "17.2.3",
+    "exceljs": "4.4.0",
+    "express": "5.1.0",
+    "express-rate-limit": "8.7.0",
+    "helmet": "8.1.0",
+    "mongodb": "6.20.0",
+    "pdfkit": "0.17.2",
+    "zod": "4.1.12"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "1.4.9",
+    "@types/express": "5.0.3",
+    "@types/node": "22.18.12",
+    "@types/pdfkit": "0.17.3",
+    "@types/supertest": "6.0.3",
+    "fake-indexeddb": "^6.2.4",
+    "jsdom": "26.1.0",
+    "mongodb-memory-server": "10.2.3",
+    "playwright-core": "^1.64.0",
+    "supertest": "7.1.4",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

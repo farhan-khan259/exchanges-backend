@@ -1,0 +1,164 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
+import vm from 'node:vm';
+const sandbox:any={console,structuredClone,Date,URL,TextEncoder,TextDecoder,Uint8Array,ArrayBuffer,setTimeout,clearTimeout};
+vm.runInNewContext(await readFile('../frontend/public/offline-engine.js','utf8'),sandbox);
+const engine=sandbox.KhataOfflineEngine;
+
+test('bank/cash, independent khata, corrections, stock, authorization and idempotency in offline accounting engine',async()=>{
+  const actor={id:'owner',tenantId:'business',branchId:'branch',name:'Owner',platformAdmin:false,mustChangePassword:false,permissions:['operations.read','transaction.create','customer.write','settings.write','report.read']};
+  let snapshot:any={rows:{branch:[{id:'branch',tenantId:'business',active:true,createdAt:new Date()}],currency:[{code:'USD',active:true}],customer:[{id:'party',tenantId:'business',branchId:'branch',name:'Party'}]}};
+  const run=async(path:string,body?:any,key=randomUUID(),at=new Date().toISOString(),who=actor)=>{const r=await engine.runLocal(snapshot,who,path,body?'POST':'GET',body,key,at);snapshot={rows:r.rows};return r.data;};
+  const debt=await run('/dues',{partyId:'party',amount:'50000',note:'Opening balance'});
+  assert.equal((await run('/parties/party')).balance,'50000.00');
+  assert.equal((snapshot.rows.khataStockEntry||[]).length,0);
+  const boundary=new Date(new Date(Date.now()+5*3600000).toISOString().slice(0,10)+'T00:00:00+05:00');
+  const oldBank=await run('/payments',{partyId:'party',amount:'1000',paymentMode:'BANK'},randomUUID(),new Date(boundary.getTime()-1).toISOString());
+  const key=randomUUID(),body={partyId:'party',amount:'2000',paymentMode:'BANK'};
+  const bank=await run('/payments',body,key,boundary.toISOString());
+  const retry=await run('/payments',body,key,boundary.toISOString());assert.equal(retry.id,bank.id);
+  let dash=await run('/dashboard');assert.equal(dash.bankReceived,'3000.00');assert.equal(dash.bankReceivedToday,'2000.00');assert.equal(dash.cash,'0');
+  const cash=await run('/payments',{partyId:'party',amount:'500'});
+  dash=await run('/dashboard');assert.equal(dash.cash,'500');assert.equal(dash.bankReceived,'3000.00');assert.equal((await run('/parties/party')).balance,'46500.00');
+  assert.equal((snapshot.rows.khataPosition||[]).length,0);
+  const edited=await run(`/entries/${bank.id}/correct`,{action:'EDIT',values:{amount:'2500',paymentMode:'BANK',note:'Updated'},reason:'Correct amount'});
+  dash=await run('/dashboard');assert.equal(dash.bankReceived,'3500.00');assert.equal(dash.bankReceivedToday,'2500.00');assert.equal(dash.cash,'500');
+  await run(`/entries/${edited.id}/correct`,{action:'DELETE',reason:'Remove duplicate payment'});
+  dash=await run('/dashboard');assert.equal(dash.bankReceived,'1000.00');assert.equal(dash.bankReceivedToday,'0.00');
+  await run(`/entries/${oldBank.id}/correct`,{action:'EDIT',values:{amount:'1000',paymentMode:'BANK'},reason:'Update historic receipt'});
+  assert.equal((await run('/dashboard')).bankReceivedToday,'0.00');
+  // Invalid edits and duplicate deletes leave original financial state intact.
+  let before=JSON.stringify(snapshot);
+  await assert.rejects(run(`/entries/${cash.id}/correct`,{action:'EDIT',values:{amount:'999999',paymentMode:'BANK'},reason:'Invalid larger payment'}),/exceeds/);
+  assert.equal(JSON.stringify(snapshot),before);
+  await assert.rejects(run(`/entries/${edited.id}/correct`,{action:'DELETE',reason:'Duplicate delete'}),/Already reversed/);
+  await assert.rejects(run('/payments',{partyId:'party',amount:'999999',paymentMode:'CASH'}),/exceeds/);
+  await assert.rejects(run('/dues',{partyId:'party',amount:'-1'}));
+  await assert.rejects(run(`/entries/${debt.id}/correct`,{action:'DELETE',reason:'Would overpay khata'}),/negative khata/);
+  await assert.rejects(run(`/entries/${cash.id}/correct`,{action:'DELETE',reason:'Unauthorized user'},randomUUID(),new Date().toISOString(),{...actor,permissions:['operations.read']}),/Permission denied/);
+  // Paid debt can be edited atomically, without a second receivable.
+  await run(`/entries/${debt.id}/correct`,{action:'EDIT',values:{amount:'60000',note:'Adjusted opening'},reason:'Correct opening debt'});
+  assert.equal((await run('/parties/party')).balance,'58500.00');
+  await run('/payments',{partyId:'party',amount:'58500',paymentMode:'BANK'});
+  assert.equal((await run('/parties/party')).balance,'0.00');
+  assert.equal((snapshot.rows.khataPosition||[]).length,0);
+  const stock=await run('/stock',{currencyCode:'USD',quantity:'100',rate:'280'});
+  const changedStock=await run(`/stock/${stock.id}/correct`,{action:'EDIT',values:{quantity:'120',rate:'280',note:'Correct stock'},reason:'Correct quantity'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('120.0000'));
+  const sale=await run('/give',{partyId:'party',currencyCode:'USD',quantity:'20',quotedRate:'280',saleRate:'300',paymentMode:'CREDIT'});
+  const changedSale=await run(`/entries/${sale.id}/correct`,{action:'EDIT',values:{quantity:'10',quotedRate:'280',saleRate:'310',paymentMode:'CREDIT'},reason:'Correct sale'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('110.0000'));assert.equal((await run('/parties/party')).balance,'3100.00');
+  assert.equal((await run('/reports?type=PNL')).summary.netProfit,'300.00');
+  await run(`/entries/${changedSale.id}/correct`,{action:'DELETE',reason:'Cancel currency sale'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('120.0000'));assert.equal((await run('/parties/party')).balance,'0.00');
+  assert.equal((await run('/reports?type=PNL')).summary.netProfit,'0.00');
+  await run(`/stock/${changedStock.id}/correct`,{action:'DELETE',reason:'Cancel stock addition'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('0.0000'));
+  const purchase=await run('/buy',{partyId:'party',currencyCode:'USD',quantity:'10',rate:'280'});
+  const changedPurchase=await run(`/entries/${purchase.id}/correct`,{action:'EDIT',values:{quantity:'12',rate:'290'},reason:'Correct purchase'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('12.0000'));
+  await run(`/entries/${changedPurchase.id}/correct`,{action:'DELETE',reason:'Cancel purchase'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('0.0000'));
+  const adjustment=await run('/cash',{kind:'ADJUSTMENT',direction:'IN',amount:'100',reason:'Opening cash'});
+  const cashBefore=(await run('/dashboard')).cash;
+  const adjusted=await run(`/cash/${adjustment.id}/correct`,{action:'EDIT',values:{amount:'200',direction:'IN',reason:'Correct opening'},reason:'Adjust amount'});
+  assert.equal(Number((await run('/dashboard')).cash),Number(cashBefore)+100);
+  await run(`/cash/${adjusted.id}/correct`,{action:'DELETE',reason:'Remove adjustment'});
+  assert.equal(Number((await run('/dashboard')).cash),Number(cashBefore)-100);
+});
+
+
+test('requested accounting flows against transactional MongoDB and authenticated HTTP APIs',async()=>{
+  const {MongoMemoryReplSet}=await import('mongodb-memory-server');
+  const replica=process.env.TEST_MONGODB_URI?null:await MongoMemoryReplSet.create({binary:{version:'7.0.14'},replSet:{count:1,storageEngine:'wiredTiger',args:['--nounixsocket']}});
+  const uri=new URL(process.env.TEST_MONGODB_URI || replica!.getUri());uri.pathname='/changes_'+randomUUID().replaceAll('-','');process.env.MONGODB_URI=uri.toString();
+  const {db,seedRoles,token,hash}=await import('../src/core.js');
+  try {
+    const {initializeDatabase}=await import('../src/database.js');await initializeDatabase(db);
+    const {app}=await import('../src/index.js');const supertest=(await import('supertest')).default;const http=supertest(app);
+    const tenant=await db.tenant.create({data:{name:'Changes Test'}});
+    await db.subscription.create({data:{tenantId:tenant.id,startsAt:new Date(Date.now()-86400000),expiresAt:new Date(Date.now()+86400000)}});
+    await db.settings.create({data:{tenantId:tenant.id,legalName:'Changes Test'}});
+    const branch=await db.branch.create({data:{tenantId:tenant.id,name:'Workspace'}});
+    await db.transaction(tx=>seedRoles(tx,tenant.id));
+    const role=await db.role.findFirst({where:{tenantId:tenant.id,name:'Owner'}});
+    const user=await db.user.create({data:{tenantId:tenant.id,branchId:branch.id,roleId:role!.id,name:'Owner',email:randomUUID()+'@test.local',passwordHash:'unused',mustChangePassword:false}});
+    const raw=token(),csrf=token();await db.authSession.create({data:{userId:user.id,tokenHash:hash(raw),csrf,expiresAt:new Date(Date.now()+86400000)}});
+    const cookie='exchange_session='+raw;
+    await db.currency.create({data:{code:'USD',name:'Dollar',symbol:'$'}});
+    const party=await db.customer.create({data:{tenantId:tenant.id,branchId:branch.id,name:'Party'}});
+    const actor:any={permissions:['operations.read','settings.write']};
+    let snapshot:any;
+    const refresh=async()=>{const res=await http.get('/api/sync/snapshot').set('Cookie',cookie);assert.equal(res.status,200);snapshot={rows:res.body.rows};};
+    await refresh();
+    const run=async(path:string,body?:any,key=randomUUID(),at=new Date().toISOString(),who=actor)=>{
+      if(who!==actor) {
+        const original=await db.user.findFirst({where:{id:user.id}});
+        const readRole=await db.role.findFirst({where:{tenantId:tenant.id,name:'Auditor'}});
+        await db.user.update({where:{id:user.id},data:{roleId:readRole!.id}});
+        try{const denied=await http.post('/api'+path).set('Cookie',cookie).set('Origin','http://localhost:5174').set('X-CSRF-Token',csrf).set('Idempotency-Key',key).send(body);assert.equal(denied.status,403);throw new Error(denied.body.error);}finally{await db.user.update({where:{id:user.id},data:{roleId:original!.roleId}});}
+      }
+      path=path.replaceAll('/party','/'+party.id);if(body?.partyId==='party')body={...body,partyId:party.id};
+      let req=body?http.post('/api'+path).set('Origin','http://localhost:5174').set('X-CSRF-Token',csrf).set('Idempotency-Key',key).set('X-Offline-Created-At',at).set('X-Offline-Account',tenant.id+':'+user.id).send(body):http.get('/api'+path);
+      const res=await req.set('Cookie',cookie);if(res.status>=400)throw new Error(res.body.error || JSON.stringify(res.body));await refresh();return res.body;
+    };
+  const debt=await run('/dues',{partyId:'party',amount:'50000',note:'Opening balance'});
+  assert.equal((await run('/parties/party')).balance,'50000.00');
+  assert.equal((snapshot.rows.khataStockEntry||[]).length,0);
+  const boundary=new Date(new Date(Date.now()+5*3600000).toISOString().slice(0,10)+'T00:00:00+05:00');
+  const oldBank=await run('/payments',{partyId:'party',amount:'1000',paymentMode:'BANK'},randomUUID(),new Date(boundary.getTime()-1).toISOString());
+  const key=randomUUID(),body={partyId:'party',amount:'2000',paymentMode:'BANK'};
+  const bank=await run('/payments',body,key,boundary.toISOString());
+  const retry=await run('/payments',body,key,boundary.toISOString());assert.equal(retry.id,bank.id);
+  let dash=await run('/dashboard');assert.equal(dash.bankReceived,'3000.00');assert.equal(dash.bankReceivedToday,'2000.00');assert.equal(dash.cash,'0');
+  const cash=await run('/payments',{partyId:'party',amount:'500'});
+  dash=await run('/dashboard');assert.equal(dash.cash,'500');assert.equal(dash.bankReceived,'3000.00');assert.equal((await run('/parties/party')).balance,'46500.00');
+  assert.equal((snapshot.rows.khataPosition||[]).length,0);
+  const edited=await run(`/entries/${bank.id}/correct`,{action:'EDIT',values:{amount:'2500',paymentMode:'BANK',note:'Updated'},reason:'Correct amount'});
+  dash=await run('/dashboard');assert.equal(dash.bankReceived,'3500.00');assert.equal(dash.bankReceivedToday,'2500.00');assert.equal(dash.cash,'500');
+  await run(`/entries/${edited.id}/correct`,{action:'DELETE',reason:'Remove duplicate payment'});
+  dash=await run('/dashboard');assert.equal(dash.bankReceived,'1000.00');assert.equal(dash.bankReceivedToday,'0.00');
+  await run(`/entries/${oldBank.id}/correct`,{action:'EDIT',values:{amount:'1000',paymentMode:'BANK'},reason:'Update historic receipt'});
+  assert.equal((await run('/dashboard')).bankReceivedToday,'0.00');
+  // Invalid edits and duplicate deletes leave original financial state intact.
+  let before=JSON.stringify(snapshot);
+  await assert.rejects(run(`/entries/${cash.id}/correct`,{action:'EDIT',values:{amount:'999999',paymentMode:'BANK'},reason:'Invalid larger payment'}),/exceeds/);
+  assert.equal(JSON.stringify(snapshot),before);
+  await assert.rejects(run(`/entries/${edited.id}/correct`,{action:'DELETE',reason:'Duplicate delete'}),/Already reversed/);
+  await assert.rejects(run('/payments',{partyId:'party',amount:'999999',paymentMode:'CASH'}),/exceeds/);
+  await assert.rejects(run('/dues',{partyId:'party',amount:'-1'}));
+  await assert.rejects(run(`/entries/${debt.id}/correct`,{action:'DELETE',reason:'Would overpay khata'}),/negative khata/);
+  await assert.rejects(run(`/entries/${cash.id}/correct`,{action:'DELETE',reason:'Unauthorized user'},randomUUID(),new Date().toISOString(),{...actor,permissions:['operations.read']}),/Permission denied/);
+  // Paid debt can be edited atomically, without a second receivable.
+  await run(`/entries/${debt.id}/correct`,{action:'EDIT',values:{amount:'60000',note:'Adjusted opening'},reason:'Correct opening debt'});
+  assert.equal((await run('/parties/party')).balance,'58500.00');
+  await run('/payments',{partyId:'party',amount:'58500',paymentMode:'BANK'});
+  assert.equal((await run('/parties/party')).balance,'0.00');
+  assert.equal((snapshot.rows.khataPosition||[]).length,0);
+  const stock=await run('/stock',{currencyCode:'USD',quantity:'100',rate:'280'});
+  const changedStock=await run(`/stock/${stock.id}/correct`,{action:'EDIT',values:{quantity:'120',rate:'280',note:'Correct stock'},reason:'Correct quantity'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('120.0000'));
+  const sale=await run('/give',{partyId:'party',currencyCode:'USD',quantity:'20',quotedRate:'280',saleRate:'300',paymentMode:'CREDIT'});
+  const changedSale=await run(`/entries/${sale.id}/correct`,{action:'EDIT',values:{quantity:'10',quotedRate:'280',saleRate:'310',paymentMode:'CREDIT'},reason:'Correct sale'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('110.0000'));assert.equal((await run('/parties/party')).balance,'3100.00');
+  assert.equal((await run('/reports?type=PNL')).summary.netProfit,'300.00');
+  await run(`/entries/${changedSale.id}/correct`,{action:'DELETE',reason:'Cancel currency sale'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('120.0000'));assert.equal((await run('/parties/party')).balance,'0.00');
+  assert.equal((await run('/reports?type=PNL')).summary.netProfit,'0.00');
+  await run(`/stock/${changedStock.id}/correct`,{action:'DELETE',reason:'Cancel stock addition'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('0.0000'));
+  const purchase=await run('/buy',{partyId:'party',currencyCode:'USD',quantity:'10',rate:'280'});
+  const changedPurchase=await run(`/entries/${purchase.id}/correct`,{action:'EDIT',values:{quantity:'12',rate:'290'},reason:'Correct purchase'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('12.0000'));
+  await run(`/entries/${changedPurchase.id}/correct`,{action:'DELETE',reason:'Cancel purchase'});
+  assert.equal(Number((await run('/stock'))[0].quantity),Number('0.0000'));
+  const adjustment=await run('/cash',{kind:'ADJUSTMENT',direction:'IN',amount:'100',reason:'Opening cash'});
+  const cashBefore=(await run('/dashboard')).cash;
+  const adjusted=await run(`/cash/${adjustment.id}/correct`,{action:'EDIT',values:{amount:'200',direction:'IN',reason:'Correct opening'},reason:'Adjust amount'});
+  assert.equal(Number((await run('/dashboard')).cash),Number(cashBefore)+100);
+  await run(`/cash/${adjusted.id}/correct`,{action:'DELETE',reason:'Remove adjustment'});
+  assert.equal(Number((await run('/dashboard')).cash),Number(cashBefore)-100);
+  } finally {await db.close();if(replica)await replica.stop();}
+});
